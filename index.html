@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Daylight Gain Tracker</title>
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    body { max-width: 860px; margin: 28px auto; padding: 0 16px; }
+    h1 { margin: 0 0 6px; }
+    .muted { color: #555; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 14px; margin: 14px 0; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; }
+    label { display: block; font-size: 13px; color: #333; margin-bottom: 6px; }
+    input { padding: 10px 12px; border: 1px solid #ccc; border-radius: 10px; font-size: 16px; width: 180px; }
+    button { padding: 10px 14px; border: 1px solid #111; background: #111; color: #fff; border-radius: 10px; font-size: 16px; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .error { color: #b00020; }
+    .kpis { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .kpi { border: 1px solid #eee; border-radius: 12px; padding: 12px; }
+    .kpi .label { font-size: 12px; color: #666; }
+    .kpi .value { font-size: 22px; font-weight: 650; margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid #eee; }
+    th { font-size: 13px; color: #555; }
+    .foot { font-size: 12px; color: #666; line-height: 1.4; }
+    .spinner { display:inline-block; width:14px; height:14px; border:2px solid #ccc; border-top-color:#111; border-radius:50%; animation: spin 0.8s linear infinite; vertical-align: -2px; margin-right: 8px;}
+    @keyframes spin { to { transform: rotate(360deg);} }
+    @media (max-width: 720px) { .kpis { grid-template-columns: 1fr; } input { width: 100%; } }
+  </style>
+</head>
+<body>
+  <h1>Daylight Gain Tracker</h1>
+  <p class="muted">Enter a ZIP code to see how many more minutes of daylight you’re getting each day (today vs yesterday) plus a 14-day trend.</p>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label for="zip">ZIP code (US)</label>
+        <input id="zip" inputmode="numeric" autocomplete="postal-code" placeholder="e.g., 21201" maxlength="5" />
+      </div>
+      <button id="go">Calculate</button>
+      <button id="useSaved" type="button" style="background:#fff;color:#111;border-color:#ccc;">Use saved ZIP</button>
+    </div>
+    <p id="status" class="muted" style="margin:10px 0 0;"></p>
+    <p id="err" class="error" style="margin:8px 0 0;"></p>
+  </div>
+
+  <div id="results" class="card" style="display:none;">
+    <div id="place" class="muted" style="margin-bottom:10px;"></div>
+
+    <div class="kpis">
+      <div class="kpi">
+        <div class="label">Today’s daylight</div>
+        <div class="value" id="todayLen">—</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Yesterday’s daylight</div>
+        <div class="value" id="ydayLen">—</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Change (today vs yesterday)</div>
+        <div class="value" id="delta">—</div>
+      </div>
+    </div>
+
+    <h3 style="margin:16px 0 8px;">Next 14 days</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Date</th>
+          <th>Daylight</th>
+          <th>Change vs prior day</th>
+        </tr>
+      </thead>
+      <tbody id="trendBody"></tbody>
+    </table>
+
+    <p class="foot" style="margin-top:12px;">
+      Data sources: Zippopotam.us (ZIP → latitude/longitude) and Sunrise-Sunset.org (sunrise/sunset). Daylight duration is computed as (sunset − sunrise) for each date.
+    </p>
+  </div>
+
+<script>
+  const el = (id) => document.getElementById(id);
+
+  const ZIP_KEY = "daylightTracker:lastZip";
+  const CACHE_KEY = "daylightTracker:cache:v1"; // basic local cache of API results
+
+  function setStatus(msg, busy=false) {
+    el("status").innerHTML = busy ? `<span class="spinner"></span>${msg}` : msg;
+  }
+  function setError(msg="") { el("err").textContent = msg; }
+
+  function isValidUSZip(zip) {
+    return /^[0-9]{5}$/.test(zip);
+  }
+
+  function yyyyMmDd(date) {
+    const y = date.getFullYear();
+    const m = String(date.getMonth() + 1).padStart(2, "0");
+    const d = String(date.getDate()).padStart(2, "0");
+    return `${y}-${m}-${d}`;
+  }
+
+  function fmtMinutes(mins) {
+    const sign = mins < 0 ? "-" : "";
+    const abs = Math.abs(mins);
+    const whole = Math.floor(abs);
+    const sec = Math.round((abs - whole) * 60);
+    if (whole === 0) return `${sign}${sec}s`;
+    if (sec === 0) return `${sign}${whole}m`;
+    return `${sign}${whole}m ${sec}s`;
+  }
+
+  function fmtDurationMinutes(mins) {
+    // convert minutes to Hh Mm
+    const total = Math.round(mins);
+    const h = Math.floor(total / 60);
+    const m = total % 60;
+    if (h <= 0) return `${m}m`;
+    if (m === 0) return `${h}h`;
+    return `${h}h ${m}m`;
+  }
+
+  function loadCache() {
+    try { return JSON.parse(localStorage.getItem(CACHE_KEY) || "{}"); }
+    catch { return {}; }
+  }
+  function saveCache(cache) {
+    try { localStorage.setItem(CACHE_KEY, JSON.stringify(cache)); } catch {}
+  }
+
+  async function zipToLatLng(zip) {
+    // Zippopotam.us: https://api.zippopotam.us/us/{zip}
+    const url = `https://api.zippopotam.us/us/${zip}`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("ZIP code not found.");
+    const data = await res.json();
+    const place = data.places && data.places[0];
+    if (!place) throw new Error("No location data returned for that ZIP.");
+    return {
+      zip,
+      city: place["place name"],
+      state: place["state abbreviation"],
+      lat: parseFloat(place["latitude"]),
+      lng: parseFloat(place["longitude"]),
+    };
+  }
+
+  async function daylightForDate(lat, lng, dateStr) {
+    // Sunrise-Sunset API: https://api.sunrise-sunset.org/json?lat=..&lng=..&date=YYYY-MM-DD&formatted=0
+    const cache = loadCache();
+    const key = `${lat.toFixed(4)},${lng.toFixed(4)}:${dateStr}`;
+    if (cache[key]) return cache[key];
+
+    const url = `https://api.sunrise-sunset.org/json?lat=${encodeURIComponent(lat)}&lng=${encodeURIComponent(lng)}&date=${encodeURIComponent(dateStr)}&formatted=0`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("Sunrise/Sunset API error.");
+    const data = await res.json();
+    if (!data || data.status !== "OK") throw new Error("Sunrise/Sunset API returned an unexpected result.");
+
+    const sunrise = new Date(data.results.sunrise);
+    const sunset  = new Date(data.results.sunset);
+
+    // Daylight duration is independent of timezone if we subtract UTC timestamps.
+    const minutes = (sunset.getTime() - sunrise.getTime()) / 60000;
+
+    const payload = { minutes };
+    cache[key] = payload;
+    saveCache(cache);
+    return payload;
+  }
+
+  async function compute(zip) {
+    setError("");
+    el("results").style.display = "none";
+
+    if (!isValidUSZip(zip)) {
+      setStatus("");
+      setError("Please enter a valid 5-digit US ZIP code.");
+      return;
+    }
+
+    setStatus("Looking up location…", true);
+    const loc = await zipToLatLng(zip);
+
+    localStorage.setItem(ZIP_KEY, zip);
+
+    const today = new Date();
+    const dates = [];
+    // We’ll compute yesterday, today, and the next 14 days
+    const start = new Date(today);
+    start.setDate(today.getDate() - 1);
+    for (let i = 0; i < 16; i++) { // yesterday + today + 14 more = 16 total
+      const d = new Date(start);
+      d.setDate(start.getDate() + i);
+      dates.push(d);
+    }
+
+    setStatus("Fetching sunrise/sunset & calculating daylight…", true);
+
+    // Fetch all days in parallel
+    const daylight = await Promise.all(
+      dates.map(d => daylightForDate(loc.lat, loc.lng, yyyyMmDd(d)))
+    );
+
+    // Build trend data (minutes + delta vs previous day)
+    const trend = daylight.map((x, idx) => {
+      const minutes = x.minutes;
+      const delta = idx === 0 ? null : (minutes - daylight[idx - 1].minutes);
+      return { date: dates[idx], minutes, delta };
+    });
+
+    // Today is index 1 (because index 0 is yesterday)
+    const yday = trend[0];
+    const tday = trend[1];
+    const change = tday.minutes - yday.minutes;
+
+    // Render
+    el("place").textContent = `${loc.city}, ${loc.state} (ZIP ${loc.zip}) • lat ${loc.lat.toFixed(4)}, lng ${loc.lng.toFixed(4)}`;
+    el("todayLen").textContent = fmtDurationMinutes(tday.minutes);
+    el("ydayLen").textContent  = fmtDurationMinutes(yday.minutes);
+
+    const sign = change >= 0 ? "+" : "−";
+    el("delta").textContent = `${sign}${fmtMinutes(change).replace("-", "")}`;
+
+    const tbody = el("trendBody");
+    tbody.innerHTML = "";
+
+    // Show next 14 days starting today (trend[1]..trend[15])
+    const fmtDate = new Intl.DateTimeFormat(undefined, { weekday: "short", month: "short", day: "numeric" });
+
+    for (let i = 1; i < trend.length; i++) {
+      const r = trend[i];
+      const tr = document.createElement("tr");
+
+      const tdDate = document.createElement("td");
+      tdDate.textContent = fmtDate.format(r.date);
+
+      const tdLen = document.createElement("td");
+      tdLen.textContent = fmtDurationMinutes(r.minutes);
+
+      const tdDelta = document.createElement("td");
+      if (r.delta == null) tdDelta.textContent = "—";
+      else {
+        const s = r.delta >= 0 ? "+" : "−";
+        tdDelta.textContent = `${s}${fmtMinutes(r.delta).replace("-", "")}`;
+      }
+
+      tr.appendChild(tdDate);
+      tr.appendChild(tdLen);
+      tr.appendChild(tdDelta);
+      tbody.appendChild(tr);
+    }
+
+    el("results").style.display = "block";
+    setStatus("");
+  }
+
+  el("go").addEventListener("click", async () => {
+    const zip = el("zip").value.trim();
+    try { await compute(zip); }
+    catch (e) { setStatus(""); setError(e?.message || "Something went wrong."); }
+  });
+
+  el("useSaved").addEventListener("click", async () => {
+    const saved = localStorage.getItem(ZIP_KEY);
+    if (!saved) { setError("No saved ZIP yet — enter one first."); return; }
+    el("zip").value = saved;
+    try { await compute(saved); }
+    catch (e) { setStatus(""); setError(e?.message || "Something went wrong."); }
+  });
+
+  // Convenience: allow Enter key to run
+  el("zip").addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") el("go").click();
+  });
+</script>
+</body>
+</html>
